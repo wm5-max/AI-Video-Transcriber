@@ -182,6 +182,7 @@ class VideoTranscriber {
     this.fetchModelsBtn     = document.getElementById('fetchModelsBtn');
     this.fetchStatus        = document.getElementById('fetchStatus');
     this.modelSelect        = document.getElementById('modelSelect');
+    this.whisperModelSize   = document.getElementById('whisperModelSize');
     this.fetchIcon          = document.getElementById('fetchIcon');
     this.uploadZone         = document.getElementById('uploadZone');
     this.uploadPickBtn      = document.getElementById('uploadPickBtn');
@@ -215,7 +216,7 @@ class VideoTranscriber {
     this.apiKeyInput.addEventListener('input', debouncedFetch);
 
     // Persist settings
-    [this.modelBaseUrl, this.apiKeyInput, this.modelSelect, this.summaryLangSel, this.summaryStyleSel].forEach(el => {
+    [this.modelBaseUrl, this.apiKeyInput, this.modelSelect, this.whisperModelSize, this.summaryLangSel, this.summaryStyleSel].forEach(el => {
       el.addEventListener('change', () => this._saveSettings());
     });
 
@@ -300,10 +301,12 @@ class VideoTranscriber {
   /* ── Settings persistence ─────────────────────────────── */
   _saveSettings() {
     const s = {
-      baseUrl:  this.modelBaseUrl.value,
-      apiKey:   this.apiKeyInput.value,
-      model:    this.modelSelect.value,
-      summaryLang: this.summaryLangSel.value,
+      baseUrl:      this.modelBaseUrl.value,
+      apiKey:       this.apiKeyInput.value,
+      model:        this.modelSelect.value,
+      whisperModel: this.whisperModelSize.value,
+      summaryLang:  this.summaryLangSel.value,
+      summaryStyle: this.summaryStyleSel.value,
     };
     try { localStorage.setItem('vt_settings', JSON.stringify(s)); } catch (_) {}
   }
@@ -316,10 +319,11 @@ class VideoTranscriber {
         return;
       }
       const s = JSON.parse(raw);
-      if (s.baseUrl)     this.modelBaseUrl.value = s.baseUrl;
-      if (s.apiKey)      this.apiKeyInput.value  = s.apiKey;
-      if (s.summaryLang) this.summaryLangSel.value = s.summaryLang;
-      if (s.summaryStyle) this.summaryStyleSel.value = s.summaryStyle;
+      if (s.baseUrl)       this.modelBaseUrl.value = s.baseUrl;
+      if (s.apiKey)        this.apiKeyInput.value  = s.apiKey;
+      if (s.summaryLang)   this.summaryLangSel.value = s.summaryLang;
+      if (s.summaryStyle)  this.summaryStyleSel.value = s.summaryStyle;
+      if (s.whisperModel)  this.whisperModelSize.value = s.whisperModel;
       // Model options will be restored after fetching
       this._savedModel = s.model || '';
 
@@ -398,51 +402,7 @@ class VideoTranscriber {
     this.fetchStatus.textContent = msg;
   }
 
-  /* ── Transcription ────────────────────────────────────── */
-  async _startTranscription() {
-    if (this.submitBtn.disabled) return;
-
-    const url     = this.videoUrlInput.value.trim();
-    const sumLang = this.summaryLangSel.value;
-
-    if (!url) { this._showError(this.t('error_invalid_url')); return; }
-
-    this._setLoading(true);
-    this._hideError();
-    this._showProgress();
-
-    try {
-      const fd = new FormData();
-      fd.append('url',              url);
-      fd.append('summary_language', sumLang);
-
-      const apiKey  = this.apiKeyInput.value.trim();
-      const baseUrl = this.modelBaseUrl.value.trim().replace(/\/$/, '');
-      const modelId = this.modelSelect.value;
-      if (apiKey)  fd.append('api_key',       apiKey);
-      if (baseUrl) fd.append('model_base_url', baseUrl);
-      if (modelId) fd.append('model_id',       modelId);
-
-      const resp = await fetch(`${this.apiBase}/process-video`, { method: 'POST', body: fd });
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        throw new Error(err.detail || 'Request failed');
-      }
-
-      const data = await resp.json();
-      this.currentTaskId = data.task_id;
-
-      this._initSP();
-      this._updateProgress(5, this.t('preparing'), true);
-      this._startSSE();
-      this._saveSettings();
-
-    } catch (err) {
-      this._showError(this.t('error_processing_failed') + err.message);
-      this._setLoading(false);
-      this._hideProgress();
-    }
-  }
+  /* Transcription handled by the consolidated _startTranscription (single definition kept) */
 
   async _startFileUpload(file) {
     if (this.submitBtn.disabled) return;
@@ -468,10 +428,13 @@ class VideoTranscriber {
     this._showProgress();
 
     const sumLang = this.summaryLangSel.value;
+    const sumStyle = this.summaryStyleSel.value;
     try {
       const fd = new FormData();
       fd.append('file', file, file.name);
       fd.append('summary_language', sumLang);
+      fd.append('summary_style', sumStyle);
+      fd.append('whisper_model_size', this.whisperModelSize.value);
 
       const apiKey  = this.apiKeyInput.value.trim();
       const baseUrl = this.modelBaseUrl.value.trim().replace(/\/$/, '');
@@ -520,7 +483,7 @@ class VideoTranscriber {
 
         if (task.status === 'completed') {
           this._stopSP(); this._stopSSE(); this._setLoading(false); this._hideProgress();
-          this._showResults(task.script, task.summary, task.video_title, task.translation, task.detected_language, task.summary_language);
+          this._showResults(task.transcript, task.summary, task.video_title, task.translation, task.detected_language, task.summary_language);
         } else if (task.status === 'error') {
           this._stopSP(); this._stopSSE(); this._setLoading(false); this._hideProgress();
           this._showError(task.error || 'Processing error');
@@ -537,7 +500,7 @@ class VideoTranscriber {
             const task = await r.json();
             if (task?.status === 'completed') {
               this._stopSP(); this._setLoading(false); this._hideProgress();
-              this._showResults(task.script, task.summary, task.video_title, task.translation, task.detected_language, task.summary_language);
+              this._showResults(task.transcript, task.summary, task.video_title, task.translation, task.detected_language, task.summary_language);
               return;
             }
           }
@@ -809,7 +772,7 @@ class VideoTranscriber {
           div.innerHTML = `
             <div class="history-info">
               <div class="history-title">${item.video_title || 'Untitled'}</div>
-              <div class="history-meta">${new Date(item.created_at).toLocaleString()} • ${item.detected_language || '?'} → ${item.summary_language}</div>
+              <div class="history-meta">${new Date(item.created_at).toLocaleString()} • ${item.detected_language || '?'} → ${item.summary_language} • ${item.summary_style || ''}</div>
             </div>
             <div class="history-actions">
               <button class="btn-dl view-btn" title="View"><i class="fas fa-eye"></i></button>
@@ -860,6 +823,7 @@ class VideoTranscriber {
       fd.append('url', url);
       fd.append('summary_language', sumLang);
       fd.append('summary_style', sumStyle);
+      fd.append('whisper_model_size', this.whisperModelSize.value);
 
       const apiKey = this.apiKeyInput.value.trim();
       const baseUrl = this.modelBaseUrl.value.trim().replace(/\/$/, '');
@@ -907,6 +871,7 @@ class VideoTranscriber {
         fd.append('url', url);
         fd.append('summary_language', sumLang);
         fd.append('summary_style', sumStyle);
+        fd.append('whisper_model_size', this.whisperModelSize.value);
 
         const apiKey = this.apiKeyInput.value.trim();
         const baseUrl = this.modelBaseUrl.value.trim().replace(/\/$/, '');

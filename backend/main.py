@@ -14,11 +14,11 @@ import re
 import openai
 from datetime import datetime
 
-from video_processor import VideoProcessor
-from transcriber import Transcriber
-from summarizer import Summarizer
-from translator import Translator
-from database import db
+from .video_processor import VideoProcessor
+from .transcriber import Transcriber
+from .summarizer import Summarizer
+from .translator import Translator
+from .database import db
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -63,6 +63,7 @@ tasks = {}
 # 本地上传：允许的类型与大小上限（MB），可用环境变量 UPLOAD_MAX_MB 调整
 UPLOAD_ALLOWED_EXT = frozenset({".txt", ".mp3", ".mp4", ".m4a", ".wav", ".webm", ".mkv", ".ogg", ".flac"})
 UPLOAD_MAX_MB = int(os.getenv("UPLOAD_MAX_MB", "200"))
+DEFAULT_WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
 
 
 def _sanitize_title_for_filename(title: str) -> str:
@@ -92,12 +93,28 @@ def _txt_to_raw_transcript_markdown(body: str) -> str:
     ])
 
 
+async def broadcast_task_update(task_id: str, task_data: dict) -> None:
+    """将任务状态更新广播到所有订阅该任务的 SSE 连接队列。"""
+    try:
+        payload = json.dumps(task_data, ensure_ascii=False)
+        queues = sse_connections.get(task_id, [])
+        for q in list(queues):
+            try:
+                await q.put(payload)
+            except Exception:
+                # 队列可能已关闭或连接异常，忽略单个失败
+                pass
+    except Exception as e:
+        logger.error(f"广播任务更新失败: {e}")
+
+
 async def _run_post_extract_pipeline(
     task_id: str,
     raw_script: str,
     video_title: str,
     source_ref: str,
     summary_language: str,
+    summary_style: str,
     request_summarizer: Summarizer,
     dedup_url: Optional[str] = None,
     api_key: str = "",
@@ -228,7 +245,7 @@ async def _run_post_extract_pipeline(
         progress=100,
         message="处理完成！",
         video_title=video_title,
-        script=script_with_title,
+        transcript=script_with_title,
         summary=summary_with_source,
         script_path=str(script_path),
         summary_path=str(summary_path),
@@ -282,9 +299,11 @@ async def list_models(
 async def _enqueue_upload_job(
     file: UploadFile,
     summary_language: str,
+    summary_style: str,
     api_key: str,
     model_base_url: str,
     model_id: str,
+    whisper_model_size: str = DEFAULT_WHISPER_MODEL_SIZE,
 ) -> dict:
     """保存上传文件并入队 process_upload_task，返回 {task_id, message}。"""
     raw_name = file.filename or "upload.bin"
@@ -332,7 +351,13 @@ async def _enqueue_upload_job(
     source_label = f"upload:{safe_name}"
 
     # 创建数据库任务记录
-    await db.create_task(task_id, url=source_label, video_title=video_title)
+    await db.create_task(
+        task_id,
+        url=source_label,
+        video_title=video_title,
+        summary_language=summary_language,
+        summary_style=summary_style,
+    )
     # 加载到内存缓存
     task_from_db = await db.get_task(task_id)
     if task_from_db:
@@ -346,9 +371,11 @@ async def _enqueue_upload_job(
             video_title,
             ext,
             summary_language,
+            summary_style,
             api_key,
             model_base_url,
             model_id,
+            whisper_model_size,
         )
     )
     active_tasks[task_id] = bg
@@ -360,9 +387,11 @@ async def _enqueue_upload_job(
 async def process_video(
     url: str = Form(default=""),
     summary_language: str = Form(default="zh"),
+    summary_style: str = Form(default="executive"),
     api_key: str = Form(default=""),
     model_base_url: str = Form(default=""),
     model_id: str = Form(default=""),
+    whisper_model_size: str = Form(default=DEFAULT_WHISPER_MODEL_SIZE),
     file: Optional[UploadFile] = File(None),
 ):
     """
@@ -372,7 +401,13 @@ async def process_video(
     try:
         if file is not None and (file.filename or "").strip():
             return await _enqueue_upload_job(
-                file, summary_language, api_key, model_base_url, model_id
+                file,
+                summary_language,
+                summary_style,
+                api_key,
+                model_base_url,
+                model_id,
+                whisper_model_size,
             )
 
         stripped = (url or "").strip()
@@ -398,14 +433,28 @@ async def process_video(
         processing_urls.add(url)
         
         # 创建数据库任务记录
-        await db.create_task(task_id, url=url)
+        await db.create_task(
+            task_id,
+            url=url,
+            summary_language=summary_language,
+            summary_style=summary_style,
+        )
         # 加载到内存缓存
         task_from_db = await db.get_task(task_id)
         if task_from_db:
             tasks[task_id] = task_from_db
         
         # 创建并跟踪异步任务
-        task = asyncio.create_task(process_video_task(task_id, url, summary_language, api_key, model_base_url, model_id))
+        task = asyncio.create_task(process_video_task(
+            task_id,
+            url,
+            summary_language,
+            summary_style,
+            api_key,
+            model_base_url,
+            model_id,
+            whisper_model_size,
+        ))
         active_tasks[task_id] = task
         
         return {"task_id": task_id, "message": "任务已创建，正在处理中..."}
@@ -421,9 +470,11 @@ async def process_video_task(
     task_id: str,
     url: str,
     summary_language: str,
+    summary_style: str,
     api_key: str = "",
     model_base_url: str = "",
     model_id: str = "",
+    whisper_model_size: str = DEFAULT_WHISPER_MODEL_SIZE,
 ):
     """
     异步处理视频任务
@@ -449,7 +500,11 @@ async def process_video_task(
         else:
             request_summarizer = summarizer  # 全局实例（使用环境变量）
 
-        subtitle_text, sub_title, sub_lang = await video_processor.fetch_subtitles(url, TEMP_DIR)
+        try:
+            subtitle_text, sub_title, sub_lang = await asyncio.wait_for(video_processor.fetch_subtitles(url, TEMP_DIR), timeout=120)
+        except asyncio.TimeoutError:
+            logger.warning(f"字幕探测超时，回退到音频下载路径: {url}")
+            subtitle_text, sub_title, sub_lang = None, None, None
 
         if subtitle_text:
             # ── 快速路径：有字幕，跳过音频下载和 Whisper ──────────────────
@@ -471,9 +526,13 @@ async def process_video_task(
                 tasks[task_id] = updated_task
             await broadcast_task_update(task_id, tasks[task_id])
 
-            audio_path, video_title = await video_processor.download_and_convert(
-                url, TEMP_DIR, prefetched_title=sub_title or None
-            )
+            try:
+                audio_path, video_title = await asyncio.wait_for(
+                    video_processor.download_and_convert(url, TEMP_DIR, prefetched_title=sub_title or None),
+                    timeout=300,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("视频下载或转换超时，请稍后重试") from exc
 
             await db.update_task(task_id, progress=35, message="音频下载完成，准备转录...")
             updated_task = await db.get_task(task_id)
@@ -487,7 +546,15 @@ async def process_video_task(
                 tasks[task_id] = updated_task
             await broadcast_task_update(task_id, tasks[task_id])
 
-            raw_script = await transcriber.transcribe(audio_path)
+            task_transcriber = Transcriber(model_size=whisper_model_size or DEFAULT_WHISPER_MODEL_SIZE)
+            try:
+                raw_script = await asyncio.wait_for(task_transcriber.transcribe(audio_path), timeout=600)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("语音转录超时，请稍后重试") from exc
+            updated_task = await db.get_task(task_id)
+            if updated_task:
+                tasks[task_id] = updated_task
+            await broadcast_task_update(task_id, tasks[task_id])
 
         await _run_post_extract_pipeline(
             task_id=task_id,
@@ -495,6 +562,7 @@ async def process_video_task(
             video_title=video_title,
             source_ref=url,
             summary_language=summary_language,
+            summary_style=summary_style,
             request_summarizer=request_summarizer,
             dedup_url=url,
             api_key=api_key,
@@ -531,13 +599,21 @@ async def process_video_task(
 async def process_upload(
     file: UploadFile = File(...),
     summary_language: str = Form(default="zh"),
+    summary_style: str = Form(default="executive"),
     api_key: str = Form(default=""),
     model_base_url: str = Form(default=""),
     model_id: str = Form(default=""),
+    whisper_model_size: str = Form(default=DEFAULT_WHISPER_MODEL_SIZE),
 ):
     """独立上传入口；逻辑与 multipart 带 file 的 /api/process-video 相同。"""
     return await _enqueue_upload_job(
-        file, summary_language, api_key, model_base_url, model_id
+        file,
+        summary_language,
+        summary_style,
+        api_key,
+        model_base_url,
+        model_id,
+        whisper_model_size,
     )
 
 
@@ -548,9 +624,11 @@ async def process_upload_task(
     video_title: str,
     ext_lower: str,
     summary_language: str,
+    summary_style: str,
     api_key: str = "",
     model_base_url: str = "",
     model_id: str = "",
+    whisper_model_size: str = DEFAULT_WHISPER_MODEL_SIZE,
 ):
     source_ref = f"upload:{original_name}"
     try:
@@ -608,6 +686,7 @@ async def process_upload_task(
             video_title=video_title,
             source_ref=source_ref,
             summary_language=summary_language,
+            summary_style=summary_style,
             request_summarizer=request_summarizer,
             dedup_url=None,
             api_key=api_key,
@@ -635,6 +714,121 @@ async def process_upload_task(
         if updated_task:
             tasks[task_id] = updated_task
         await broadcast_task_update(task_id, tasks[task_id])
+
+
+async def process_text_task(
+    task_id: str,
+    text: str,
+    summary_language: str,
+    summary_style: str,
+    api_key: str = "",
+    model_base_url: str = "",
+    model_id: str = "",
+    whisper_model_size: str = DEFAULT_WHISPER_MODEL_SIZE,
+):
+    """处理用户粘贴的纯文本（转录内容）。"""
+    source_ref = "paste_text"
+    video_title = "Pasted Transcript"
+    try:
+        if api_key:
+            effective_url = model_base_url.rstrip("/") or None
+            request_summarizer = Summarizer(
+                api_key=api_key,
+                base_url=effective_url,
+                model=model_id or None,
+            )
+        else:
+            request_summarizer = summarizer
+
+        await db.update_task(task_id, status="processing", progress=10, message="正在处理粘贴文本...")
+        updated_task = await db.get_task(task_id)
+        if updated_task:
+            tasks[task_id] = updated_task
+        await broadcast_task_update(task_id, tasks[task_id])
+
+        if not text or not text.strip():
+            raise Exception("文本内容为空")
+
+        raw_script = _txt_to_raw_transcript_markdown(text)
+        transcriber.last_detected_language = None
+
+        await _run_post_extract_pipeline(
+            task_id=task_id,
+            raw_script=raw_script,
+            video_title=video_title,
+            source_ref=source_ref,
+            summary_language=summary_language,
+            summary_style=summary_style,
+            request_summarizer=request_summarizer,
+            dedup_url=None,
+            api_key=api_key,
+            model_base_url=model_base_url,
+            model_id=model_id,
+        )
+    except Exception as e:
+        logger.error(f"任务 {task_id} 处理失败: {str(e)}")
+        if task_id in active_tasks:
+            del active_tasks[task_id]
+        tasks[task_id] = tasks.get(task_id, {})
+        tasks[task_id].update({
+            "status": "error",
+            "error": str(e),
+            "message": f"处理失败: {str(e)}",
+        })
+        await db.update_task(
+            task_id,
+            status="error",
+            error=str(e),
+            message=f"处理失败: {str(e)}",
+        )
+        updated_task = await db.get_task(task_id)
+        if updated_task:
+            tasks[task_id] = updated_task
+        await broadcast_task_update(task_id, tasks[task_id])
+
+
+@app.post("/api/process-text")
+async def process_text_endpoint(
+    text: str = Form(...),
+    summary_language: str = Form(default="zh"),
+    summary_style: str = Form(default="executive"),
+    api_key: str = Form(default=""),
+    model_base_url: str = Form(default=""),
+    model_id: str = Form(default=""),
+    whisper_model_size: str = Form(default=DEFAULT_WHISPER_MODEL_SIZE),
+):
+    """Endpoint to process pasted plain text as a transcript."""
+    try:
+        task_id = str(uuid.uuid4())
+        video_title = "Pasted Transcript"
+        await db.create_task(
+            task_id,
+            url="paste_text",
+            video_title=video_title,
+            summary_language=summary_language,
+            summary_style=summary_style,
+        )
+        task_from_db = await db.get_task(task_id)
+        if task_from_db:
+            tasks[task_id] = task_from_db
+
+        bg = asyncio.create_task(
+            process_text_task(
+                task_id,
+                text,
+                summary_language,
+                summary_style,
+                api_key,
+                model_base_url,
+                model_id,
+                whisper_model_size,
+            )
+        )
+        active_tasks[task_id] = bg
+        return {"task_id": task_id, "message": "任务已创建，正在处理中..."}
+    except Exception as e:
+        logger.error(f"创建粘贴文本任务失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/task-status/{task_id}")
@@ -810,6 +1004,7 @@ async def process_batch(
     api_key: str = Form(default=""),
     model_base_url: str = Form(default=""),
     model_id: str = Form(default=""),
+    whisper_model_size: str = Form(default=DEFAULT_WHISPER_MODEL_SIZE),
 ):
     """
     批量处理多个URL
@@ -847,14 +1042,28 @@ async def process_batch(
             processing_urls.add(url)
             
             # 创建数据库任务记录
-            await db.create_task(task_id, url=url)
+            await db.create_task(
+                task_id,
+                url=url,
+                summary_language=summary_language,
+                summary_style=summary_style,
+            )
             # 加载到内存缓存
             task_from_db = await db.get_task(task_id)
             if task_from_db:
                 tasks[task_id] = task_from_db
             
             # 创建并跟踪异步任务
-            task = asyncio.create_task(process_video_task(task_id, url, summary_language, api_key, model_base_url, model_id))
+            task = asyncio.create_task(process_video_task(
+                task_id,
+                url,
+                summary_language,
+                summary_style,
+                api_key,
+                model_base_url,
+                model_id,
+                whisper_model_size,
+            ))
             active_tasks[task_id] = task
             
             task_ids.append(task_id)
@@ -909,7 +1118,7 @@ async def get_history(
         summary_style=summary_style,
         status=status
     )
-    return {"tasks": tasks_list, "count": len(tasks_list)}
+    return {"history": tasks_list, "count": len(tasks_list)}
 
 
 @app.get("/api/history/{task_id}")

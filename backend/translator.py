@@ -5,7 +5,7 @@ from typing import Optional
 
 from openai import OpenAI
 
-from llm_sanitize import strip_llm_artifacts
+from .llm_sanitize import strip_llm_artifacts
 
 logger = logging.getLogger(__name__)
 

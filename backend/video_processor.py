@@ -74,9 +74,15 @@ class VideoProcessor:
 
         try:
             # 1. 快速探测：获取视频信息和字幕可用性，不下载任何内容
-            check_opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+            check_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "socket_timeout": 15,
+                "extract_flat": False,
+            }
             with yt_dlp.YoutubeDL(check_opts) as ydl:
-                info = await asyncio.to_thread(ydl.extract_info, url, False)
+                info = await asyncio.wait_for(asyncio.to_thread(ydl.extract_info, url, False), timeout=45)
 
             video_title = info.get("title", "unknown")
             manual_subs: dict = info.get("subtitles") or {}
@@ -117,9 +123,10 @@ class VideoProcessor:
                 "quiet": True,
                 "no_warnings": True,
                 "noplaylist": True,
+                "socket_timeout": 15,
             }
             with yt_dlp.YoutubeDL(dl_opts) as ydl:
-                await asyncio.to_thread(ydl.download, [url])
+                await asyncio.wait_for(asyncio.to_thread(ydl.download, [url]), timeout=45)
 
             # 3. 查找下载的字幕文件
             sub_files = list(sub_dir.glob("*.vtt")) + list(sub_dir.glob("*.srt"))
@@ -353,19 +360,16 @@ class VideoProcessor:
             import asyncio
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 if prefetched_title:
-                    # 标题和时长已在 fetch_subtitles 中获取，直接下载，跳过重复探测
                     video_title = prefetched_title
                     expected_duration = 0
                     logger.info(f"复用预取标题，跳过 extract_info: {video_title}")
                 else:
-                    # 获取视频信息（放到线程池避免阻塞事件循环）
-                    info = await asyncio.to_thread(ydl.extract_info, url, False)
+                    info = await asyncio.wait_for(asyncio.to_thread(ydl.extract_info, url, False), timeout=45)
                     video_title = info.get('title', 'unknown')
                     expected_duration = info.get('duration') or 0
                     logger.info(f"视频标题: {video_title}")
-                
-                # 下载视频（放到线程池避免阻塞事件循环）
-                await asyncio.to_thread(ydl.download, [url])
+
+                await asyncio.wait_for(asyncio.to_thread(ydl.download, [url]), timeout=180)
             
             # 查找生成的m4a文件
             audio_file = str(output_dir / f"audio_{unique_id}.m4a")

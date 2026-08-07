@@ -111,12 +111,12 @@ def main():
     print("=" * 50)
     
     try:
-        # 切换到backend目录并启动服务
-        backend_dir = Path(__file__).parent / "backend"
-        os.chdir(backend_dir)
+        # 从项目根目录启动，确保 backend 包可以正确解析相对导入
+        project_root = Path(__file__).parent
+        os.chdir(project_root)
         
         cmd = [
-            sys.executable, "-m", "uvicorn", "main:app",
+            sys.executable, "-m", "uvicorn", "backend.main:app",
             "--host", host,
             "--port", str(port)
         ]

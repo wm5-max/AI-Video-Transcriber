@@ -1,16 +1,14 @@
 import aiosqlite
-import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-# Database file path
-DB_PATH = Path(__file__).parent.parent / "data" / "tasks.db"
+logger = logging.getLogger(__name__)
 
-# Ensure data directory exists
+DB_PATH = Path(__file__).parent.parent / "data" / "tasks.db"
 DB_PATH.parent.mkdir(exist_ok=True)
 
-# SQL to create tables
 CREATE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
@@ -34,197 +32,174 @@ CREATE TABLE IF NOT EXISTS tasks (
     translation_filename TEXT,
     short_id TEXT,
     safe_title TEXT,
+    transcription_model_name TEXT,
+    transcription_model_version TEXT,
+    summarization_model_name TEXT,
+    summarization_model_version TEXT,
+    api_provider TEXT,
+    api_endpoint TEXT,
+    transcription_input_tokens INTEGER,
+    transcription_output_tokens INTEGER,
+    summarization_input_tokens INTEGER,
+    summarization_output_tokens INTEGER,
+    processing_time_seconds REAL,
+    total_tokens_used INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 """
+
+MIGRATE_COLS = [
+    "ALTER TABLE tasks ADD COLUMN transcription_model_name TEXT",
+    "ALTER TABLE tasks ADD COLUMN transcription_model_version TEXT",
+    "ALTER TABLE tasks ADD COLUMN summarization_model_name TEXT",
+    "ALTER TABLE tasks ADD COLUMN summarization_model_version TEXT",
+    "ALTER TABLE tasks ADD COLUMN api_provider TEXT",
+    "ALTER TABLE tasks ADD COLUMN api_endpoint TEXT",
+    "ALTER TABLE tasks ADD COLUMN transcription_input_tokens INTEGER",
+    "ALTER TABLE tasks ADD COLUMN transcription_output_tokens INTEGER",
+    "ALTER TABLE tasks ADD COLUMN summarization_input_tokens INTEGER",
+    "ALTER TABLE tasks ADD COLUMN summarization_output_tokens INTEGER",
+    "ALTER TABLE tasks ADD COLUMN processing_time_seconds REAL",
+    "ALTER TABLE tasks ADD COLUMN total_tokens_used INTEGER",
+]
+
 
 class Database:
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
 
     async def init(self):
-        """Initialize the database and create tables."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(CREATE_TABLES_SQL)
             await db.commit()
+            for sql in MIGRATE_COLS:
+                try:
+                    await db.execute(sql)
+                    await db.commit()
+                except Exception:
+                    pass  # column already exists
 
-    async def create_task(self, task_id: str, url: str = "", title: str = "", video_title: str = "") -> None:
-        """Create a new task record."""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """
-                INSERT INTO tasks (id, url, title, video_title, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (task_id, url, title, video_title, datetime.now(), datetime.now())
-            )
-            await db.commit()
+    async def _connect(self) -> aiosqlite.Connection:
+        db = await aiosqlite.connect(self.db_path)
+        db.row_factory = aiosqlite.Row
+        return db
 
-    async def update_task(
-        self,
-        task_id: str,
-        status: Optional[str] = None,
-        progress: Optional[int] = None,
-        message: Optional[str] = None,
-        error: Optional[str] = None,
-        video_title: Optional[str] = None,
-        transcript: Optional[str] = None,
-        translation: Optional[str] = None,
-        summary: Optional[str] = None,
-        summary_language: Optional[str] = None,
-        summary_style: Optional[str] = None,
-        detected_language: Optional[str] = None,
-        script_path: Optional[str] = None,
-        summary_path: Optional[str] = None,
-        translation_path: Optional[str] = None,
-        raw_script_file: Optional[str] = None,
-        translation_filename: Optional[str] = None,
-        short_id: Optional[str] = None,
-        safe_title: Optional[str] = None
-    ) -> None:
-        """Update a task with various fields."""
-        async with aiosqlite.connect(self.db_path) as db:
-            # Build dynamic update query
-            fields = []
-            values = []
-            
-            if status is not None:
-                fields.append("status = ?")
-                values.append(status)
-            if progress is not None:
-                fields.append("progress = ?")
-                values.append(progress)
-            if message is not None:
-                fields.append("message = ?")
-                values.append(message)
-            if error is not None:
-                fields.append("error = ?")
-                values.append(error)
-            if video_title is not None:
-                fields.append("video_title = ?")
-                values.append(video_title)
-            if transcript is not None:
-                fields.append("transcript = ?")
-                values.append(transcript)
-            if translation is not None:
-                fields.append("translation = ?")
-                values.append(translation)
-            if summary is not None:
-                fields.append("summary = ?")
-                values.append(summary)
-            if summary_language is not None:
-                fields.append("summary_language = ?")
-                values.append(summary_language)
-            if summary_style is not None:
-                fields.append("summary_style = ?")
-                values.append(summary_style)
-            if detected_language is not None:
-                fields.append("detected_language = ?")
-                values.append(detected_language)
-            if script_path is not None:
-                fields.append("script_path = ?")
-                values.append(script_path)
-            if summary_path is not None:
-                fields.append("summary_path = ?")
-                values.append(summary_path)
-            if translation_path is not None:
-                fields.append("translation_path = ?")
-                values.append(translation_path)
-            if raw_script_file is not None:
-                fields.append("raw_script_file = ?")
-                values.append(raw_script_file)
-            if translation_filename is not None:
-                fields.append("translation_filename = ?")
-                values.append(translation_filename)
-            if short_id is not None:
-                fields.append("short_id = ?")
-                values.append(short_id)
-            if safe_title is not None:
-                fields.append("safe_title = ?")
-                values.append(safe_title)
-            
-            if not fields:
-                return
-            
-            fields.append("updated_at = ?")
-            values.append(datetime.now())
-            values.append(task_id)
-            
-            query = f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?"
-            await db.execute(query, values)
-            await db.commit()
+    async def _safe_execute(self, operation):
+        try:
+            return await operation()
+        except Exception as e:
+            logger.warning(f"DB op failed: {e}")
+            return None
+
+    async def create_task(self, task_id: str, url: str = "", title: str = "",
+                          video_title: str = "", summary_language: Optional[str] = None,
+                          summary_style: Optional[str] = None) -> None:
+        async def _op():
+            db = await self._connect()
+            try:
+                await db.execute(
+                    "INSERT INTO tasks (id,url,title,video_title,summary_language,summary_style,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (task_id, url, title, video_title, summary_language, summary_style, datetime.now(), datetime.now()),
+                )
+                await db.commit()
+            finally:
+                await db.close()
+        await self._safe_execute(_op)
+
+    async def update_task(self, task_id: str, **kwargs) -> None:
+        """Update any task columns by keyword argument."""
+        if not kwargs:
+            return
+        async def _op():
+            db = await self._connect()
+            try:
+                fields = [f"{k} = ?" for k in kwargs]
+                values = list(kwargs.values())
+                fields.append("updated_at = ?")
+                values.append(datetime.now())
+                values.append(task_id)
+                await db.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?", values)
+                await db.commit()
+            finally:
+                await db.close()
+        await self._safe_execute(_op)
 
     async def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """Get a task by ID."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM tasks WHERE id = ?", (task_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    return dict(row)
-                return None
+        async def _op():
+            db = await self._connect()
+            try:
+                async with db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        data = dict(row)
+                        data["task_id"] = data.get("id")
+                        return data
+                    return None
+            finally:
+                await db.close()
+        return await self._safe_execute(_op)
 
-    async def get_history(
-        self,
-        limit: int = 50,
-        offset: int = 0,
-        summary_language: Optional[str] = None,
-        summary_style: Optional[str] = None,
-        status: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """Get task history with optional filters."""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            query = "SELECT * FROM tasks"
-            params = []
-            conditions = []
-
-            if summary_language:
-                conditions.append("summary_language = ?")
-                params.append(summary_language)
-            if summary_style:
-                conditions.append("summary_style = ?")
-                params.append(summary_style)
-            if status:
-                conditions.append("status = ?")
-                params.append(status)
-
-            if conditions:
-                query += " WHERE " + " AND ".join(conditions)
-
-            query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-            params.extend([limit, offset])
-
-            async with db.execute(query, params) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+    async def get_history(self, limit: int = 50, offset: int = 0,
+                          summary_language: Optional[str] = None,
+                          summary_style: Optional[str] = None,
+                          status: Optional[str] = None) -> List[Dict[str, Any]]:
+        async def _op():
+            db = await self._connect()
+            try:
+                query = "SELECT * FROM tasks"
+                params: list = []
+                conds = []
+                if summary_language:
+                    conds.append("summary_language = ?"); params.append(summary_language)
+                if summary_style:
+                    conds.append("summary_style = ?"); params.append(summary_style)
+                if status:
+                    conds.append("status = ?"); params.append(status)
+                if conds:
+                    query += " WHERE " + " AND ".join(conds)
+                query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+                params.extend([limit, offset])
+                async with db.execute(query, params) as cur:
+                    rows = await cur.fetchall()
+                    result = []
+                    for row in rows:
+                        data = dict(row)
+                        data["task_id"] = data.get("id")
+                        result.append(data)
+                    return result
+            finally:
+                await db.close()
+        return await self._safe_execute(_op) or []
 
     async def delete_task(self, task_id: str) -> bool:
-        """Delete a task by ID."""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-            await db.commit()
-            return cursor.rowcount > 0
+        async def _op():
+            db = await self._connect()
+            try:
+                cur = await db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                await db.commit()
+                return cur.rowcount > 0
+            finally:
+                await db.close()
+        result = await self._safe_execute(_op)
+        return bool(result)
 
     async def update_transcript(self, task_id: str, transcript: str) -> bool:
-        """Update just the transcript (for editing)."""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                """
-                UPDATE tasks
-                SET transcript = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (transcript, datetime.now(), task_id)
-            )
-            await db.commit()
-            return cursor.rowcount > 0
+        async def _op():
+            db = await self._connect()
+            try:
+                cur = await db.execute(
+                    "UPDATE tasks SET transcript = ?, updated_at = ? WHERE id = ?",
+                    (transcript, datetime.now(), task_id),
+                )
+                await db.commit()
+                return cur.rowcount > 0
+            finally:
+                await db.close()
+        result = await self._safe_execute(_op)
+        return bool(result)
 
-# Global database instance
+
 db = Database()

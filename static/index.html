@@ -501,6 +501,27 @@
     .history-title { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .history-meta { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
     .history-actions { display: flex; gap: 8px; margin-left: 12px; }
+    .history-select { margin-right: 12px; accent-color: var(--accent); cursor: pointer; }
+
+    /* History Manager */
+    .history-manager { display: flex; flex-direction: column; gap: 14px; }
+    .history-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .history-search { position: relative; flex: 1; min-width: 200px; }
+    .history-search i { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--text-dim); }
+    .history-search input { padding-left: 32px; }
+    .history-filters { display: flex; gap: 6px; flex-wrap: wrap; }
+    .history-filters select { background: var(--surface-2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 10px; font-size: 12px; }
+    .history-actions-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+    .btn-secondary { background: var(--surface-2); border: 1px solid var(--border); color: var(--text-muted); border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 500; cursor: pointer; transition: all .2s; }
+    .btn-secondary:hover { border-color: var(--accent-dim); color: var(--accent-text); }
+    .btn-primary { background: var(--accent); border: 1px solid var(--accent); color: #fff; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 500; cursor: pointer; transition: all .2s; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-h); }
+    .history-stats { display: flex; flex-wrap: wrap; gap: 14px; padding: 10px; background: var(--surface); border-radius: var(--r-sm); border: 1px solid var(--border); font-size: 12px; color: var(--text-muted); }
+    .history-stats .stat { display: flex; align-items: center; gap: 6px; }
+    .history-empty, .history-loading { text-align: center; padding: 20px; color: var(--text-dim); font-size: 13px; }
+    .history-pagination { display: flex; justify-content: center; align-items: center; gap: 14px; padding: 12px 0; }
+    .history-pagination #historyPageInfo { font-size: 12px; color: var(--text-muted); }
 
     .res-top {
       display: flex;
@@ -745,6 +766,18 @@
           </select>
         </div>
 
+        <!-- Whisper model size selector -->
+        <div>
+          <label class="s-label" data-i18n="whisper_model">Whisper Model</label>
+          <select id="whisperModelSize" class="s-select">
+            <option value="tiny">tiny</option>
+            <option value="base" selected>base</option>
+            <option value="small">small</option>
+            <option value="medium">medium</option>
+            <option value="large">large</option>
+          </select>
+        </div>
+
       </div>
     </div>
   </div>
@@ -813,6 +846,9 @@
         <button class="tab-btn" data-tab="translation" id="translationTabBtn" style="display:none;">
           <span data-i18n="translation">Translation</span>
         </button>
+        <button class="tab-btn" data-tab="history" id="historyTabBtn">
+          <span data-i18n="history_manager">History</span>
+        </button>
       </div>
 
       <div id="scriptTab" class="tab-pane active">
@@ -823,6 +859,51 @@
       </div>
       <div id="translationTab" class="tab-pane">
         <div class="md-content" id="translationContent"></div>
+      </div>
+      <div id="historyTab" class="tab-pane">
+        <div class="history-manager">
+          <div class="history-toolbar">
+            <div class="history-search">
+              <i class="fas fa-search"></i>
+              <input type="text" id="historySearch" placeholder="Search history..." data-i18n-placeholder="history_search_placeholder">
+            </div>
+            <div class="history-filters">
+              <select id="historyFilterStatus" data-i18n="filter_status">
+                <option value="">All Status</option>
+                <option value="completed">Completed</option>
+                <option value="error">Error</option>
+                <option value="processing">Processing</option>
+              </select>
+              <select id="historyFilterLanguage" data-i18n="filter_language">
+                <option value="">All Languages</option>
+              </select>
+              <select id="historyFilterModel" data-i18n="filter_model">
+                <option value="">All Models</option>
+              </select>
+            </div>
+            <div class="history-actions-btns">
+              <button class="btn-secondary" id="historySelectAll" data-i18n="select_all">Select All</button>
+              <button class="btn-secondary" id="historyDeselectAll" data-i18n="deselect_all" style="display:none;">Deselect All</button>
+              <button class="btn-primary" id="historyBatchDownload" data-i18n="batch_download" disabled>Batch Download</button>
+              <button class="btn-primary" id="historyRefresh" data-i18n="refresh"><i class="fas fa-sync-alt"></i></button>
+            </div>
+          </div>
+          
+          <div class="history-stats" id="historyStats" style="display:none;">
+            <span class="stat"><i class="fas fa-database"></i> <span id="statTotal">0</span> items</span>
+            <span class="stat"><i class="fas fa-check-circle"></i> <span id="statCompleted">0</span> completed</span>
+            <span class="stat"><i class="fas fa-microchip"></i> <span id="statTotalTokens">0</span> tokens</span>
+            <span class="stat"><i class="fas fa-clock"></i> <span id="statTotalTime">0s</span> total time</span>
+          </div>
+
+          <div id="historyList" class="history-list"></div>
+          
+          <div class="history-pagination" id="historyPagination">
+            <button class="btn-secondary" id="historyPrevPage" disabled>&laquo; Previous</button>
+            <span id="historyPageInfo">Page 1 of 1</span>
+            <button class="btn-secondary" id="historyNextPage" disabled>Next &raquo;</button>
+          </div>
+        </div>
       </div>
     </div>
 

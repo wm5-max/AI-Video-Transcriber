@@ -3,7 +3,7 @@ import openai
 import logging
 from typing import Optional
 
-from llm_sanitize import strip_llm_artifacts
+from .llm_sanitize import strip_llm_artifacts
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,7 @@ class Summarizer:
         # 允许前端指定模型，覆盖硬编码的 gpt-3.5-turbo / gpt-4o
         self.fast_model     = model or "gpt-3.5-turbo"
         self.advanced_model = model or "gpt-4o"
+        self._last_token_usage = None  # Track last API call token usage
         
         # 支持的语言映射
         self.language_map = {
@@ -52,6 +53,21 @@ class Summarizer:
             "ko": "한국어",
             "ar": "العربية"
         }
+    
+    @property
+    def last_token_usage(self):
+        """Get token usage from the most recent API call."""
+        return self._last_token_usage
+    
+    def _get_token_usage(self, response):
+        """Extract token usage from OpenAI API response."""
+        if hasattr(response, 'usage') and response.usage:
+            return {
+                'input_tokens': response.usage.prompt_tokens,
+                'output_tokens': response.usage.completion_tokens,
+                'total_tokens': response.usage.total_tokens,
+            }
+        return None
     
     async def optimize_transcript(self, raw_transcript: str) -> str:
         """
@@ -183,7 +199,7 @@ class Summarizer:
             temperature=0.1
         )
         
-        return strip_llm_artifacts(response.choices[0].message.content or "")
+        return (setattr(self, "_last_token_usage", self._get_token_usage(response)) or strip_llm_artifacts(response.choices[0].message.content or ""))
 
     async def _optimize_with_chunks(self, raw_transcript: str, max_tokens: int) -> str:
         """
@@ -231,7 +247,7 @@ class Summarizer:
                     temperature=0.1
                 )
                 
-                optimized_chunk = strip_llm_artifacts(response.choices[0].message.content or "")
+                optimized_chunk = (setattr(self, "_last_token_usage", self._get_token_usage(response)) or strip_llm_artifacts(response.choices[0].message.content or ""))
                 optimized_chunks.append(optimized_chunk)
                 
             except Exception as e:
@@ -318,7 +334,7 @@ class Summarizer:
                 max_tokens=4000,  # 对齐JS：优化/格式化阶段最大tokens≈4000
                 temperature=0.1
             )
-            optimized_text = strip_llm_artifacts(response.choices[0].message.content or "")
+            optimized_text = (setattr(self, "_last_token_usage", self._get_token_usage(response)) or strip_llm_artifacts(response.choices[0].message.content or ""))
             # 移除诸如 "# Transcript" / "## Transcript" 等标题
             optimized_text = self._remove_transcript_heading(optimized_text)
             enforced = self._enforce_paragraph_max_chars(optimized_text.strip(), max_chars=400)
@@ -802,7 +818,7 @@ class Summarizer:
                 temperature=0.05  # 降低温度，提高一致性
             )
             
-            organized_text = strip_llm_artifacts(response.choices[0].message.content or "")
+            organized_text = (setattr(self, "_last_token_usage", self._get_token_usage(response)) or strip_llm_artifacts(response.choices[0].message.content or ""))
             
             # 工程验证：检查段落长度
             validated_text = self._validate_paragraph_lengths(organized_text)
@@ -881,7 +897,7 @@ Core requirements:
             temperature=0.05
         )
         
-        return strip_llm_artifacts(response.choices[0].message.content or "")
+        return (setattr(self, "_last_token_usage", self._get_token_usage(response)) or strip_llm_artifacts(response.choices[0].message.content or ""))
 
     def _validate_paragraph_lengths(self, text: str) -> str:
         """
@@ -1049,7 +1065,7 @@ Output ONLY the summary body in {language_name}."""
             temperature=0.25
         )
         
-        summary = strip_llm_artifacts(response.choices[0].message.content or "")
+        summary = (setattr(self, "_last_token_usage", self._get_token_usage(response)) or strip_llm_artifacts(response.choices[0].message.content or ""))
 
         return self._format_summary_with_meta(summary, target_language, video_title)
 
@@ -1095,7 +1111,7 @@ Output content only, no headings like "Summary:"."""
                     temperature=0.25
                 )
                 
-                chunk_summary = strip_llm_artifacts(response.choices[0].message.content or "")
+                chunk_summary = (setattr(self, "_last_token_usage", self._get_token_usage(response)) or strip_llm_artifacts(response.choices[0].message.content or ""))
                 chunk_summaries.append(chunk_summary)
                 
             except Exception as e:
@@ -1198,7 +1214,7 @@ Rules:
                 temperature=0.25
             )
 
-            return strip_llm_artifacts(response.choices[0].message.content or "")
+            return (setattr(self, "_last_token_usage", self._get_token_usage(response)) or strip_llm_artifacts(response.choices[0].message.content or ""))
         except Exception as e:
             logger.error(f"整合摘要失败: {e}")
             # 失败时直接合并
