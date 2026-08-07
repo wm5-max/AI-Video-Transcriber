@@ -969,13 +969,15 @@ Core requirements:
         
         return '\n\n'.join(basic_paragraphs)
 
-    async def summarize(self, transcript: str, target_language: str = "zh", video_title: str = None) -> str:
+    async def summarize(self, transcript: str, target_language: str = "zh", video_title: str = None, style: str = "executive") -> str:
         """
         生成视频转录的摘要
         
         Args:
             transcript: 转录文本
             target_language: 目标语言代码
+            video_title: 视频标题
+            style: 摘要风格 (executive, bullet_points, eli5, tldr, notes)
             
         Returns:
             摘要文本（Markdown格式）
@@ -991,39 +993,50 @@ Core requirements:
             
             if estimated_tokens <= max_summarize_tokens:
                 # 短文本直接摘要
-                return await self._summarize_single_text(transcript, target_language, video_title)
+                return await self._summarize_single_text(transcript, target_language, video_title, style)
             else:
                 # 长文本分块摘要
                 logger.info(f"文本较长({estimated_tokens} tokens)，启用分块摘要")
-                return await self._summarize_with_chunks(transcript, target_language, video_title, max_summarize_tokens)
+                return await self._summarize_with_chunks(transcript, target_language, video_title, max_summarize_tokens, style)
             
         except Exception as e:
             logger.error(f"生成摘要失败: {str(e)}")
             return self._generate_fallback_summary(transcript, target_language, video_title)
 
-    async def _summarize_single_text(self, transcript: str, target_language: str, video_title: str = None) -> str:
+    async def _summarize_single_text(self, transcript: str, target_language: str, video_title: str = None, style: str = "executive") -> str:
         """
         对单个文本进行摘要
         """
         # 获取目标语言名称
         language_name = self.language_map.get(target_language, "中文（简体）")
         
+        # 根据风格选择提示词
+        style_prompts = {
+            "executive": f"Write a concise EXECUTIVE SUMMARY in {language_name}. Focus on main thesis, 3-7 key takeaways, and critical facts.",
+            "bullet_points": f"Write a detailed BULLET POINT summary in {language_name}. Break down the content into logical sections with clear bullet points.",
+            "eli5": f"Explain the content in {language_name} as if I am 5 years old. Use simple analogies and very basic language.",
+            "tldr": f"Write a very brief TL;DR (Too Long; Didn't Read) in {language_name} in just 2-3 sentences.",
+            "notes": f"Create comprehensive STUDY NOTES in {language_name}. Include definitions, key concepts, and a structured outline."
+        }
+        
+        style_instruction = style_prompts.get(style, style_prompts["executive"])
+
         # 构建英文提示词，适用于所有目标语言
-        system_prompt = f"""You are an expert editor. Write a concise EXECUTIVE SUMMARY in {language_name} of the following material.
+        system_prompt = f"""You are an expert editor. {style_instruction}
 
 Hard rules:
-- Length: about 180–450 words in {language_name} (use the lower end if the source is short). Never reproduce long verbatim quotes or extended sentence-by-sentence rewrites of the transcript.
-- Content: main thesis, 3–7 key takeaways, important conclusions, and critical facts or numbers only. Tight prose; short bullet lists are OK for takeaways.
+- Language: {language_name}
+- Never reproduce long verbatim quotes or extended sentence-by-sentence rewrites of the transcript.
 - Do NOT restate the full transcript, do NOT add preamble ("Here is…"), and do NOT add closings such as offers to revise or "let me know if…" / 客套尾注.
-- Markdown: optional `## Key takeaways` then paragraphs; avoid decorative filler headings.
+- Markdown: Use appropriate Markdown formatting (headings, lists, bold text).
 
 Output ONLY the summary body in {language_name}."""
 
-        user_prompt = f"""Summarize the following content in {language_name}. Follow the system rules strictly (brief executive summary, no meta-commentary):
+        user_prompt = f"""Summarize the following content in {language_name} using the '{style}' style. Follow the system rules strictly:
 
 {transcript}"""
 
-        logger.info(f"正在生成{language_name}摘要...")
+        logger.info(f"正在生成{language_name}摘要 (风格: {style})...")
         
         # 调用OpenAI API
         response = self.client.chat.completions.create(
@@ -1040,7 +1053,7 @@ Output ONLY the summary body in {language_name}."""
 
         return self._format_summary_with_meta(summary, target_language, video_title)
 
-    async def _summarize_with_chunks(self, transcript: str, target_language: str, video_title: str, max_tokens: int) -> str:
+    async def _summarize_with_chunks(self, transcript: str, target_language: str, video_title: str, max_tokens: int, style: str = "executive") -> str:
         """
         分块摘要长文本
         """
@@ -1096,9 +1109,9 @@ Output content only, no headings like "Summary:"."""
 
         logger.info("正在整合最终摘要...")
         if len(chunk_summaries) > 10:
-            final_summary = await self._integrate_hierarchical_summaries(chunk_summaries, target_language)
+            final_summary = await self._integrate_hierarchical_summaries(chunk_summaries, target_language, style)
         else:
-            final_summary = await self._integrate_chunk_summaries(combined_summaries, target_language)
+            final_summary = await self._integrate_chunk_summaries(combined_summaries, target_language, style)
 
         return self._format_summary_with_meta(final_summary, target_language, video_title)
 
@@ -1138,29 +1151,40 @@ Output content only, no headings like "Summary:"."""
         return final_chunks
 
     async def _integrate_hierarchical_summaries(
-        self, chunk_summaries: list, target_language: str
+        self, chunk_summaries: list, target_language: str, style: str = "executive"
     ) -> str:
         """Many partial summaries: fold through the same integrator as the <=10 case."""
         combined = "\n\n".join(
             f"[Part {idx + 1}]\n{s}" for idx, s in enumerate(chunk_summaries)
         )
-        return await self._integrate_chunk_summaries(combined, target_language)
+        return await self._integrate_chunk_summaries(combined, target_language, style)
 
-    async def _integrate_chunk_summaries(self, combined_summaries: str, target_language: str) -> str:
+    async def _integrate_chunk_summaries(self, combined_summaries: str, target_language: str, style: str = "executive") -> str:
         """
         整合分块摘要为最终连贯摘要
         """
         language_name = self.language_map.get(target_language, "中文（简体）")
         
+        # 根据风格选择提示词
+        style_prompts = {
+            "executive": f"ONE concise executive summary in {language_name}. Focus on main thesis, 3-7 key takeaways, and critical facts.",
+            "bullet_points": f"ONE detailed BULLET POINT summary in {language_name}. Break down the content into logical sections with clear bullet points.",
+            "eli5": f"ONE simple explanation in {language_name} as if I am 5 years old. Use simple analogies and very basic language.",
+            "tldr": f"ONE very brief TL;DR in {language_name} in just 2-3 sentences.",
+            "notes": f"ONE set of comprehensive STUDY NOTES in {language_name}. Include definitions, key concepts, and a structured outline."
+        }
+        
+        style_instruction = style_prompts.get(style, style_prompts["executive"])
+
         try:
-            system_prompt = f"""You integrate partial summaries into ONE concise executive summary in {language_name}.
+            system_prompt = f"""You integrate partial summaries into {style_instruction}
 
 Rules:
-- Total length about 280–650 words in {language_name}; remove duplication, do not expand into a transcript-length rewrite.
-- Markdown: paragraphs separated by blank lines; optional `## Key takeaways` only if it adds clarity.
+- Total length about 280–650 words in {language_name} (except for TL;DR which should be much shorter); remove duplication, do not expand into a transcript-length rewrite.
+- Markdown: Use appropriate Markdown formatting (headings, lists, bold text).
 - No preamble, no meta-closings (e.g. offers to revise or "let me know")."""
 
-            user_prompt = f"""Merge the following partial summaries into one executive summary in {language_name}:
+            user_prompt = f"""Merge the following partial summaries into one final summary in {language_name} using the '{style}' style:
 
 {combined_summaries}"""
 

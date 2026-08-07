@@ -281,6 +281,39 @@
     }
     .inline-lang-select option { background: var(--surface-2); }
 
+    /* Summary Style Selector */
+    .inline-style {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-left: 12px;
+    }
+    .inline-style-label {
+      font-size: 13px;
+      color: var(--text-dim);
+      white-space: nowrap;
+    }
+    .inline-style-select {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      color: var(--text);
+      font-size: 13px;
+      padding: 5px 26px 5px 9px;
+      outline: none;
+      cursor: pointer;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%237d6e62' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 8px center;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    .inline-style-select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(192,120,48,.1);
+    }
+    .inline-style-select option { background: var(--surface-2); }
+
     .settings-body {
       overflow: hidden;
       max-height: 0;
@@ -452,6 +485,23 @@
     .results-panel { display: none; }
     .results-panel.show { display: block; }
 
+    .history-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      padding: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      cursor: pointer;
+      transition: background .2s;
+    }
+    .history-item:hover { background: var(--surface-2); }
+    .history-info { flex: 1; min-width: 0; }
+    .history-title { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .history-meta { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+    .history-actions { display: flex; gap: 8px; margin-left: 12px; }
+
     .res-top {
       display: flex;
       align-items: center;
@@ -584,14 +634,15 @@
     <div class="input-row">
       <div class="url-wrap">
         <i class="fas fa-link url-icon"></i>
-        <input
+        <textarea
           id="videoUrl"
-          type="url"
           class="url-input"
-          placeholder="Paste YouTube, Tiktok, Bilibili or other platform video URLs..."
+          placeholder="Paste YouTube, Tiktok, Bilibili or other platform video URLs... (One per line for batch)"
           data-i18n-placeholder="video_url_placeholder"
           required
-        >
+          rows="1"
+          style="resize: none; min-height: 46px; overflow-y: hidden;"
+        ></textarea>
       </div>
       <button type="submit" id="submitBtn" class="btn-go">
         <i class="fas fa-search"></i>
@@ -613,7 +664,7 @@
   </div>
 
   <!-- Settings row: Summary Language + AI Settings toggle -->
-  <div class="settings-row">
+    <div class="settings-row">
     <div class="inline-lang">
       <label class="inline-lang-label" for="summaryLanguage" data-i18n="summary_language">Summary Language</label>
       <select id="summaryLanguage" class="inline-lang-select">
@@ -628,6 +679,17 @@
         <option value="ja">日本語</option>
         <option value="ko">한국어</option>
         <option value="ar">العربية</option>
+      </select>
+    </div>
+
+    <div class="inline-style">
+      <label class="inline-style-label" for="summaryStyle" data-i18n="summary_style">Summary Style</label>
+      <select id="summaryStyle" class="inline-style-select">
+        <option value="executive" data-i18n="style_executive">Executive Summary</option>
+        <option value="bullet_points" data-i18n="style_bullet_points">Bullet Points</option>
+        <option value="eli5" data-i18n="style_eli5">Explain Like I'm 5</option>
+        <option value="tldr" data-i18n="style_tldr">TL;DR</option>
+        <option value="notes" data-i18n="style_notes">Detailed Notes</option>
       </select>
     </div>
 
@@ -684,6 +746,19 @@
         </div>
 
       </div>
+    </div>
+  </div>
+
+  <!-- History Section -->
+  <div class="history-section" id="historySection" style="margin-top: 24px; display: none;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+      <h3 style="font-size: 16px; font-weight: 600;" data-i18n="history_title">History</h3>
+      <button id="refreshHistory" class="btn-dl" style="padding: 4px 8px;">
+        <i class="fas fa-sync-alt"></i>
+      </button>
+    </div>
+    <div id="historyList" class="history-list" style="display: grid; gap: 10px;">
+      <!-- History items will be injected here -->
     </div>
   </div>
 

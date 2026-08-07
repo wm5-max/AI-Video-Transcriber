@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -6,17 +6,19 @@ import os
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 import aiofiles
 import uuid
 import json
 import re
 import openai
+from datetime import datetime
 
 from video_processor import VideoProcessor
 from transcriber import Transcriber
 from summarizer import Summarizer
 from translator import Translator
+from database import db
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -49,60 +51,14 @@ transcriber = Transcriber()
 summarizer = Summarizer()
 translator = Translator()
 
-# 存储任务状态 - 使用文件持久化
-import threading
-
-TASKS_FILE = TEMP_DIR / "tasks.json"
-tasks_lock = threading.Lock()
-
-def load_tasks():
-    """加载任务状态"""
-    try:
-        if TASKS_FILE.exists():
-            with open(TASKS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except:
-        pass
-    return {}
-
-def save_tasks(tasks_data):
-    """保存任务状态"""
-    try:
-        with tasks_lock:
-            with open(TASKS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(tasks_data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"保存任务状态失败: {e}")
-
-async def broadcast_task_update(task_id: str, task_data: dict):
-    """向所有连接的SSE客户端广播任务状态更新"""
-    logger.info(f"广播任务更新: {task_id}, 状态: {task_data.get('status')}, 连接数: {len(sse_connections.get(task_id, []))}")
-    if task_id in sse_connections:
-        connections_to_remove = []
-        for queue in sse_connections[task_id]:
-            try:
-                await queue.put(json.dumps(task_data, ensure_ascii=False))
-                logger.debug(f"消息已发送到队列: {task_id}")
-            except Exception as e:
-                logger.warning(f"发送消息到队列失败: {e}")
-                connections_to_remove.append(queue)
-        
-        # 移除断开的连接
-        for queue in connections_to_remove:
-            sse_connections[task_id].remove(queue)
-        
-        # 如果没有连接了，清理该任务的连接列表
-        if not sse_connections[task_id]:
-            del sse_connections[task_id]
-
-# 启动时加载任务状态
-tasks = load_tasks()
 # 存储正在处理的URL，防止重复处理
 processing_urls = set()
 # 存储活跃的任务对象，用于控制和取消
 active_tasks = {}
 # 存储SSE连接，用于实时推送状态更新
 sse_connections = {}
+# 内存任务缓存（用于快速访问，持久化由数据库负责）
+tasks = {}
 
 # 本地上传：允许的类型与大小上限（MB），可用环境变量 UPLOAD_MAX_MB 调整
 UPLOAD_ALLOWED_EXT = frozenset({".txt", ".mp3", ".mp4", ".m4a", ".wav", ".webm", ".mkv", ".ogg", ".flac"})
@@ -157,17 +113,19 @@ async def _run_post_extract_pipeline(
         raw_md_path = TEMP_DIR / raw_md_filename
         with open(raw_md_path, "w", encoding="utf-8") as f:
             f.write((raw_script or "") + f"\n\nsource: {source_ref}\n")
-        tasks[task_id].update({"raw_script_file": raw_md_filename})
-        save_tasks(tasks)
+        # 更新数据库和内存缓存
+        await db.update_task(task_id, raw_script_file=raw_md_filename)
+        updated_task = await db.get_task(task_id)
+        if updated_task:
+            tasks[task_id] = updated_task
         await broadcast_task_update(task_id, tasks[task_id])
     except Exception as e:
         logger.error(f"保存原始转录Markdown失败: {e}")
 
-    tasks[task_id].update({
-        "progress": 55,
-        "message": "正在优化转录文本...",
-    })
-    save_tasks(tasks)
+    await db.update_task(task_id, progress=55, message="正在优化转录文本...")
+    updated_task = await db.get_task(task_id)
+    if updated_task:
+        tasks[task_id] = updated_task
     await broadcast_task_update(task_id, tasks[task_id])
 
     script = await request_summarizer.optimize_transcript(raw_script)
@@ -203,11 +161,10 @@ async def _run_post_extract_pipeline(
 
     if need_translation:
         logger.info(f"需要翻译: {detected_language} -> {summary_language}")
-        tasks[task_id].update({
-            "progress": 70,
-            "message": "正在生成翻译...",
-        })
-        save_tasks(tasks)
+        await db.update_task(task_id, progress=70, message="正在生成翻译...")
+        updated_task = await db.get_task(task_id)
+        if updated_task:
+            tasks[task_id] = updated_task
         await broadcast_task_update(task_id, tasks[task_id])
 
         translation_content = await request_translator.translate_text(
@@ -218,20 +175,31 @@ async def _run_post_extract_pipeline(
         translation_path = TEMP_DIR / translation_filename
         async with aiofiles.open(translation_path, "w", encoding="utf-8") as f:
             await f.write(translation_with_title)
+        
+        # 更新数据库和内存缓存
+        await db.update_task(
+            task_id,
+            translation=translation_with_title,
+            translation_path=str(translation_path),
+            translation_filename=translation_filename
+        )
+        updated_task = await db.get_task(task_id)
+        if updated_task:
+            tasks[task_id] = updated_task
+        await broadcast_task_update(task_id, tasks[task_id])
     else:
         logger.info(
             f"不需要翻译: detected_language={detected_language}, summary_language={summary_language}, "
             f"need_translation={need_translation}"
         )
 
-    tasks[task_id].update({
-        "progress": 80,
-        "message": "正在生成摘要...",
-    })
-    save_tasks(tasks)
+    await db.update_task(task_id, progress=80, message="正在生成摘要...")
+    updated_task = await db.get_task(task_id)
+    if updated_task:
+        tasks[task_id] = updated_task
     await broadcast_task_update(task_id, tasks[task_id])
 
-    summary = await request_summarizer.summarize(script, summary_language, video_title)
+    summary = await request_summarizer.summarize(script, summary_language, video_title, summary_style)
     summary_with_source = summary + f"\n\nsource: {source_ref}\n"
 
     script_filename = f"transcript_{task_id}.md"
@@ -253,32 +221,27 @@ async def _run_post_extract_pipeline(
     async with aiofiles.open(summary_path, "w", encoding="utf-8") as f:
         await f.write(summary_with_source)
 
-    task_result = {
-        "status": "completed",
-        "progress": 100,
-        "message": "处理完成！",
-        "video_title": video_title,
-        "script": script_with_title,
-        "summary": summary_with_source,
-        "script_path": str(script_path),
-        "summary_path": str(summary_path),
-        "short_id": short_id,
-        "safe_title": safe_title,
-        "detected_language": detected_language,
-        "summary_language": summary_language,
-    }
-
-    if translation_content and translation_path:
-        task_result.update({
-            "translation": translation_with_title,
-            "translation_path": str(translation_path),
-            "translation_filename": translation_filename,
-        })
-
-    tasks[task_id].update(task_result)
-    save_tasks(tasks)
-    logger.info(f"任务完成，准备广播最终状态: {task_id}")
+    # 更新数据库和内存缓存
+    await db.update_task(
+        task_id,
+        status="completed",
+        progress=100,
+        message="处理完成！",
+        video_title=video_title,
+        script=script_with_title,
+        summary=summary_with_source,
+        script_path=str(script_path),
+        summary_path=str(summary_path),
+        short_id=short_id,
+        safe_title=safe_title,
+        detected_language=detected_language,
+        summary_language=summary_language,
+    )
+    updated_task = await db.get_task(task_id)
+    if updated_task:
+        tasks[task_id] = updated_task
     await broadcast_task_update(task_id, tasks[task_id])
+    logger.info(f"任务完成，准备广播最终状态: {task_id}")
     logger.info(f"最终状态已广播: {task_id}")
 
     if dedup_url:
@@ -291,6 +254,7 @@ async def _run_post_extract_pipeline(
 async def read_root():
     """返回前端页面"""
     return FileResponse(str(PROJECT_ROOT / "static" / "index.html"))
+
 
 @app.post("/api/models")
 async def list_models(
@@ -367,16 +331,12 @@ async def _enqueue_upload_job(
     video_title = _sanitize_title_for_filename(Path(safe_name).stem) or "upload"
     source_label = f"upload:{safe_name}"
 
-    tasks[task_id] = {
-        "status": "processing",
-        "progress": 0,
-        "message": "开始处理上传文件...",
-        "script": None,
-        "summary": None,
-        "error": None,
-        "url": source_label,
-    }
-    save_tasks(tasks)
+    # 创建数据库任务记录
+    await db.create_task(task_id, url=source_label, video_title=video_title)
+    # 加载到内存缓存
+    task_from_db = await db.get_task(task_id)
+    if task_from_db:
+        tasks[task_id] = task_from_db
 
     bg = asyncio.create_task(
         process_upload_task(
@@ -437,17 +397,12 @@ async def process_video(
         # 标记URL为正在处理
         processing_urls.add(url)
         
-        # 初始化任务状态
-        tasks[task_id] = {
-            "status": "processing",
-            "progress": 0,
-            "message": "开始处理视频...",
-            "script": None,
-            "summary": None,
-            "error": None,
-            "url": url  # 保存URL用于去重
-        }
-        save_tasks(tasks)
+        # 创建数据库任务记录
+        await db.create_task(task_id, url=url)
+        # 加载到内存缓存
+        task_from_db = await db.get_task(task_id)
+        if task_from_db:
+            tasks[task_id] = task_from_db
         
         # 创建并跟踪异步任务
         task = asyncio.create_task(process_video_task(task_id, url, summary_language, api_key, model_base_url, model_id))
@@ -460,6 +415,7 @@ async def process_video(
     except Exception as e:
         logger.error(f"处理视频时出错: {str(e)}")
         raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
+
 
 async def process_video_task(
     task_id: str,
@@ -474,12 +430,10 @@ async def process_video_task(
     """
     try:
         # ── 阶段一：优先尝试获取平台字幕（快速路径） ──────────────────────
-        tasks[task_id].update({
-            "status": "processing",
-            "progress": 10,
-            "message": "正在检测视频字幕..."
-        })
-        save_tasks(tasks)
+        await db.update_task(task_id, status="processing", progress=10, message="正在检测视频字幕...")
+        updated_task = await db.get_task(task_id)
+        if updated_task:
+            tasks[task_id] = updated_task
         await broadcast_task_update(task_id, tasks[task_id])
         await asyncio.sleep(0.1)
 
@@ -504,37 +458,33 @@ async def process_video_task(
             # 把语言写入 transcriber，保持下游逻辑一致
             transcriber.last_detected_language = sub_lang
 
-            tasks[task_id].update({
-                "progress": 40,
-                "message": f"字幕获取成功（{sub_lang}），正在处理文本..."
-            })
-            save_tasks(tasks)
+            await db.update_task(task_id, progress=40, message=f"字幕获取成功（{sub_lang}），正在处理文本...")
+            updated_task = await db.get_task(task_id)
+            if updated_task:
+                tasks[task_id] = updated_task
             await broadcast_task_update(task_id, tasks[task_id])
         else:
             # ── 慢速路径：无字幕，下载音频 → Whisper 转录 ─────────────────
-            tasks[task_id].update({
-                "progress": 15,
-                "message": "未找到字幕，正在下载视频音频..."
-            })
-            save_tasks(tasks)
+            await db.update_task(task_id, progress=15, message="未找到字幕，正在下载视频音频...")
+            updated_task = await db.get_task(task_id)
+            if updated_task:
+                tasks[task_id] = updated_task
             await broadcast_task_update(task_id, tasks[task_id])
 
             audio_path, video_title = await video_processor.download_and_convert(
                 url, TEMP_DIR, prefetched_title=sub_title or None
             )
 
-            tasks[task_id].update({
-                "progress": 35,
-                "message": "音频下载完成，准备转录..."
-            })
-            save_tasks(tasks)
+            await db.update_task(task_id, progress=35, message="音频下载完成，准备转录...")
+            updated_task = await db.get_task(task_id)
+            if updated_task:
+                tasks[task_id] = updated_task
             await broadcast_task_update(task_id, tasks[task_id])
 
-            tasks[task_id].update({
-                "progress": 40,
-                "message": "正在转录音频（Whisper）..."
-            })
-            save_tasks(tasks)
+            await db.update_task(task_id, progress=40, message="正在转录音频（Whisper）...")
+            updated_task = await db.get_task(task_id)
+            if updated_task:
+                tasks[task_id] = updated_task
             await broadcast_task_update(task_id, tasks[task_id])
 
             raw_script = await transcriber.transcribe(audio_path)
@@ -564,13 +514,18 @@ async def process_video_task(
         if task_id in active_tasks:
             del active_tasks[task_id]
             
-        tasks[task_id].update({
-            "status": "error",
-            "error": str(e),
-            "message": f"处理失败: {str(e)}"
-        })
-        save_tasks(tasks)
+        # 更新数据库和内存缓存为错误状态
+        await db.update_task(
+            task_id,
+            status="error",
+            error=str(e),
+            message=f"处理失败: {str(e)}"
+        )
+        updated_task = await db.get_task(task_id)
+        if updated_task:
+            tasks[task_id] = updated_task
         await broadcast_task_update(task_id, tasks[task_id])
+
 
 @app.post("/api/process-upload")
 async def process_upload(
@@ -613,11 +568,10 @@ async def process_upload_task(
             request_summarizer = summarizer
 
         if ext_lower == ".txt":
-            tasks[task_id].update({
-                "progress": 20,
-                "message": "正在读取文本文件...",
-            })
-            save_tasks(tasks)
+            await db.update_task(task_id, progress=20, message="正在读取文本文件...")
+            updated_task = await db.get_task(task_id)
+            if updated_task:
+                tasks[task_id] = updated_task
             await broadcast_task_update(task_id, tasks[task_id])
 
             body = saved_path.read_text(encoding="utf-8", errors="replace")
@@ -626,27 +580,24 @@ async def process_upload_task(
             transcriber.last_detected_language = None
             raw_script = _txt_to_raw_transcript_markdown(body)
         else:
-            tasks[task_id].update({
-                "progress": 15,
-                "message": "正在转换音频格式...",
-            })
-            save_tasks(tasks)
+            await db.update_task(task_id, progress=15, message="正在转换音频格式...")
+            updated_task = await db.get_task(task_id)
+            if updated_task:
+                tasks[task_id] = updated_task
             await broadcast_task_update(task_id, tasks[task_id])
 
             audio_path = await video_processor.normalize_local_media_to_m4a(saved_path, TEMP_DIR)
 
-            tasks[task_id].update({
-                "progress": 35,
-                "message": "音频准备完成，准备转录...",
-            })
-            save_tasks(tasks)
+            await db.update_task(task_id, progress=35, message="音频准备完成，准备转录...")
+            updated_task = await db.get_task(task_id)
+            if updated_task:
+                tasks[task_id] = updated_task
             await broadcast_task_update(task_id, tasks[task_id])
 
-            tasks[task_id].update({
-                "progress": 40,
-                "message": "正在转录音频（Whisper）...",
-            })
-            save_tasks(tasks)
+            await db.update_task(task_id, progress=40, message="正在转录音频（Whisper）...")
+            updated_task = await db.get_task(task_id)
+            if updated_task:
+                tasks[task_id] = updated_task
             await broadcast_task_update(task_id, tasks[task_id])
 
             raw_script = await transcriber.transcribe(audio_path)
@@ -673,7 +624,16 @@ async def process_upload_task(
             "error": str(e),
             "message": f"处理失败: {str(e)}",
         })
-        save_tasks(tasks)
+        # 更新数据库和内存缓存
+        await db.update_task(
+            task_id,
+            status="error",
+            error=str(e),
+            message=f"处理失败: {str(e)}",
+        )
+        updated_task = await db.get_task(task_id)
+        if updated_task:
+            tasks[task_id] = updated_task
         await broadcast_task_update(task_id, tasks[task_id])
 
 
@@ -683,9 +643,15 @@ async def get_task_status(task_id: str):
     获取任务状态
     """
     if task_id not in tasks:
+        # 尝试从数据库获取（可能刚创建但还未加载到内存）
+        task_from_db = await db.get_task(task_id)
+        if task_from_db:
+            tasks[task_id] = task_from_db
+            return task_from_db
         raise HTTPException(status_code=404, detail="任务不存在")
     
     return tasks[task_id]
+
 
 @app.get("/api/task-stream/{task_id}")
 async def task_stream(task_id: str):
@@ -693,7 +659,12 @@ async def task_stream(task_id: str):
     SSE实时任务状态流
     """
     if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="任务不存在")
+        # 尝试从数据库获取
+        task_from_db = await db.get_task(task_id)
+        if task_from_db:
+            tasks[task_id] = task_from_db
+        else:
+            raise HTTPException(status_code=404, detail="任务不存在")
     
     async def event_generator():
         # 创建任务专用的队列
@@ -748,6 +719,7 @@ async def task_stream(task_id: str):
         }
     )
 
+
 @app.get("/api/download/{filename}")
 async def download_file(filename: str):
     """
@@ -784,7 +756,11 @@ async def delete_task(task_id: str):
     取消并删除任务
     """
     if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="任务不存在")
+        # 检查数据库中是否存在
+        task_from_db = await db.get_task(task_id)
+        if not task_from_db:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        # 如果在数据库中但不在内存中，仍然可以删除
     
     # 如果任务还在运行，先取消它
     if task_id in active_tasks:
@@ -795,13 +771,21 @@ async def delete_task(task_id: str):
         del active_tasks[task_id]
     
     # 从处理URL列表中移除
-    task_url = tasks[task_id].get("url")
+    task_url = tasks[task_id].get("url") if task_id in tasks else None
     if task_url:
         processing_urls.discard(task_url)
     
-    # 删除任务记录
-    del tasks[task_id]
-    return {"message": "任务已取消并删除"}
+    # 删除数据库记录
+    deleted = await db.delete_task(task_id)
+    # 从内存缓存中删除
+    if task_id in tasks:
+        del tasks[task_id]
+    
+    if deleted:
+        return {"message": "任务已取消并删除"}
+    else:
+        raise HTTPException(status_code=500, detail="删除任务失败")
+
 
 @app.get("/api/tasks/active")
 async def get_active_tasks():
@@ -815,6 +799,212 @@ async def get_active_tasks():
         "processing_urls": processing_count,
         "task_ids": list(active_tasks.keys())
     }
+
+
+# 批量处理端点
+@app.post("/api/process-batch")
+async def process_batch(
+    urls: str = Form(...),  # JSON字符串格式的URL列表
+    summary_language: str = Form(default="zh"),
+    summary_style: str = Form(default="executive"),
+    api_key: str = Form(default=""),
+    model_base_url: str = Form(default=""),
+    model_id: str = Form(default=""),
+):
+    """
+    批量处理多个URL
+    """
+    try:
+        # 解析URL列表
+        url_list = json.loads(urls)
+        if not isinstance(url_list, list):
+            raise HTTPException(status_code=400, detail="URLs must be a list")
+        
+        # 生成批次ID
+        batch_id = str(uuid.uuid4())
+        
+        # 创建批次记录（可以扩展数据库来支持批次，这里先简单处理）
+        # 为每个URL创建任务
+        task_ids = []
+        for url in url_list:
+            url = url.strip()
+            if not url:
+                continue
+                
+            # 检查是否已经在处理相同的URL
+            if url in processing_urls:
+                # 查找现有任务
+                for tid, task in tasks.items():
+                    if task.get("url") == url:
+                        task_ids.append(tid)
+                        break
+                continue
+            
+            # 生成唯一任务ID
+            task_id = str(uuid.uuid4())
+            
+            # 标记URL为正在处理
+            processing_urls.add(url)
+            
+            # 创建数据库任务记录
+            await db.create_task(task_id, url=url)
+            # 加载到内存缓存
+            task_from_db = await db.get_task(task_id)
+            if task_from_db:
+                tasks[task_id] = task_from_db
+            
+            # 创建并跟踪异步任务
+            task = asyncio.create_task(process_video_task(task_id, url, summary_language, api_key, model_base_url, model_id))
+            active_tasks[task_id] = task
+            
+            task_ids.append(task_id)
+        
+        return {
+            "batch_id": batch_id,
+            "task_ids": task_ids,
+            "message": f"批次创建成功，包含 {len(task_ids)} 个任务"
+        }
+        
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON format for URLs")
+    except Exception as e:
+        logger.error(f"创建批处理任务时出错: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"批处理失败: {str(e)}")
+
+
+@app.get("/api/batch/{batch_id}/status")
+async def get_batch_status(batch_id: str):
+    """
+    获取批次状态（简化实现，实际应存储批次信息）
+    """
+    # 这里返回所有活跃任务的状态作为批次状态
+    # 在实际应用中，应该有一个批次表来跟踪批次信息
+    active_count = len(active_tasks)
+    processing_count = len(processing_urls)
+    return {
+        "batch_id": batch_id,
+        "active_tasks": active_count,
+        "processing_urls": processing_count,
+        "task_ids": list(active_tasks.keys()),
+        "message": "批次状态查询（简化实现）"
+    }
+
+
+# 历史记录端点
+@app.get("/api/history")
+async def get_history(
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    summary_language: Optional[str] = Query(None),
+    summary_style: Optional[str] = Query(None),
+    status: Optional[str] = Query(None)
+):
+    """
+    获取任务历史
+    """
+    tasks_list = await db.get_history(
+        limit=limit,
+        offset=offset,
+        summary_language=summary_language,
+        summary_style=summary_style,
+        status=status
+    )
+    return {"tasks": tasks_list, "count": len(tasks_list)}
+
+
+@app.get("/api/history/{task_id}")
+async def get_history_item(task_id: str):
+    """
+    获取单个历史任务详情
+    """
+    task = await db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
+
+
+@app.delete("/api/history/{task_id}")
+async def delete_history_item(task_id: str):
+    """
+    删除历史任务
+    """
+    deleted = await db.delete_task(task_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    # 同时从内存缓存中删除
+    if task_id in tasks:
+        del tasks[task_id]
+    return {"message": "任务已删除"}
+
+
+@app.put("/api/history/{task_id}/transcript")
+async def update_transcript(
+    task_id: str,
+    transcript: str = Form(...)
+):
+    """
+    更新任务的转录文本（用于编辑）
+    """
+    task = await db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    
+    # 更新数据库
+    updated = await db.update_transcript(task_id, transcript)
+    if not updated:
+        raise HTTPException(status_code=500, detail="更新转录失败")
+    
+    # 更新内存缓存
+    updated_task = await db.get_task(task_id)
+    if updated_task:
+        tasks[task_id] = updated_task
+    
+    return {"message": "转录已更新"}
+
+
+@app.get("/api/summary-styles")
+async def get_summary_styles():
+    """
+    获取可用的摘要风格
+    """
+    return {
+        "styles": [
+            {"id": "executive", "name": "Executive Summary", "description": "Concise executive summary with key takeaways"},
+            {"id": "bullet_points", "name": "Bullet Points", "description": "Key points formatted as bullet list"},
+            {"id": "eli5", "name": "Explain Like I'm 5", "description": "Simple explanation suitable for beginners"},
+            {"id": "tldr", "name": "TL;DR", "description": "Very brief summary of the most important points"},
+            {"id": "notes", "name": "Detailed Notes", "description": "Comprehensive notes with timestamps and details"}
+        ]
+    }
+
+
+# 后台任务：清理旧的临时文件
+async def cleanup_temp_files():
+    """清理超过24小时的临时文件"""
+    while True:
+        await asyncio.sleep(3600)  # 每小时运行一次
+        now = datetime.now()
+        for file_path in TEMP_DIR.glob("*"):
+            if file_path.is_file():
+                file_time = datetime.fromtimestamp(file_path.stat().st_mtime)
+                if (now - file_time).total_seconds() > 24 * 3600:  # 24小时
+                    try:
+                        file_path.unlink()
+                        logger.info(f"Deleted old temp file: {file_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to delete {file_path}: {e}")
+
+# 启动后台清理任务
+@app.on_event("startup")
+async def startup_event():
+    await db.init()
+    # 从数据库加载所有任务到内存缓存
+    rows = await db.get_history(limit=10000)
+    for row in rows:
+        tasks[row['id']] = row
+    # 启动清理任务
+    asyncio.create_task(cleanup_temp_files())
+
 
 if __name__ == "__main__":
     import uvicorn

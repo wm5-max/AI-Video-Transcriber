@@ -30,6 +30,7 @@ class VideoTranscriber {
         model_select:            'Model',
         model_default:           '— use server default —',
         summary_language:        'Summary Language',
+        summary_style:           'Summary Style',
         processing_progress:     'Processing',
         preparing:               'Preparing…',
         transcript_text:         'Transcript',
@@ -65,6 +66,15 @@ class VideoTranscriber {
         error_upload_type:       'Unsupported file type',
         error_upload_empty:      'File is empty',
         error_upload_size:       (mb) => `File exceeds ${mb} MB limit`,
+        history_title:           'History',
+        batch_processing:        'Batch Processing',
+        batch_status:            (done, total) => `Processing ${done}/${total} videos...`,
+        // Summary styles
+        style_executive:         'Executive Summary',
+        style_bullet_points:     'Bullet Points',
+        style_eli5:              'Explain Like I\'m 5',
+        style_tldr:              'TL;DR',
+        style_notes:             'Detailed Notes',
       },
       zh: {
         title:                   'AI 视频转录器',
@@ -80,6 +90,7 @@ class VideoTranscriber {
         model_select:            '模型',
         model_default:           '— 使用服务器默认 —',
         summary_language:        '摘要语言',
+        summary_style:           '摘要风格',
         processing_progress:     '处理进度',
         preparing:               '准备中…',
         transcript_text:         '转录文本',
@@ -115,6 +126,15 @@ class VideoTranscriber {
         error_upload_type:       '不支持的文件类型',
         error_upload_empty:      '文件为空',
         error_upload_size:       (mb) => `文件超过 ${mb} MB 限制`,
+        history_title:           '历史记录',
+        batch_processing:        '批量处理',
+        batch_status:            (done, total) => `正在处理 ${done}/${total} 个视频...`,
+        // Summary styles
+        style_executive:         '执行摘要',
+        style_bullet_points:     '要点列表',
+        style_eli5:              '像我5岁一样解释',
+        style_tldr:              'TL;DR',
+        style_notes:             '详细笔记',
       }
     };
 
@@ -150,6 +170,10 @@ class VideoTranscriber {
     this.translationTabBtn  = document.getElementById('translationTabBtn');
     this.tabBtns            = document.querySelectorAll('.tab-btn');
     this.tabPanes           = document.querySelectorAll('.tab-pane');
+    this.summaryStyleSel    = document.getElementById('summaryStyle');
+    this.historySection     = document.getElementById('historySection');
+    this.historyList        = document.getElementById('historyList');
+    this.refreshHistoryBtn  = document.getElementById('refreshHistory');
     // settings
     this.settingsToggle     = document.getElementById('settingsToggle');
     this.settingsBody       = document.getElementById('settingsBody');
@@ -191,8 +215,16 @@ class VideoTranscriber {
     this.apiKeyInput.addEventListener('input', debouncedFetch);
 
     // Persist settings
-    [this.modelBaseUrl, this.apiKeyInput, this.modelSelect, this.summaryLangSel].forEach(el => {
+    [this.modelBaseUrl, this.apiKeyInput, this.modelSelect, this.summaryLangSel, this.summaryStyleSel].forEach(el => {
       el.addEventListener('change', () => this._saveSettings());
+    });
+
+    this.refreshHistoryBtn.addEventListener('click', () => this._loadHistory());
+
+    // Auto-resize textarea
+    this.videoUrlInput.addEventListener('input', () => {
+      this.videoUrlInput.style.height = 'auto';
+      this.videoUrlInput.style.height = (this.videoUrlInput.scrollHeight) + 'px';
     });
 
     // Tabs
@@ -279,11 +311,15 @@ class VideoTranscriber {
   _loadSettings() {
     try {
       const raw = localStorage.getItem('vt_settings');
-      if (!raw) return;
+      if (!raw) {
+        this._loadHistory();
+        return;
+      }
       const s = JSON.parse(raw);
       if (s.baseUrl)     this.modelBaseUrl.value = s.baseUrl;
       if (s.apiKey)      this.apiKeyInput.value  = s.apiKey;
       if (s.summaryLang) this.summaryLangSel.value = s.summaryLang;
+      if (s.summaryStyle) this.summaryStyleSel.value = s.summaryStyle;
       // Model options will be restored after fetching
       this._savedModel = s.model || '';
 
@@ -296,7 +332,10 @@ class VideoTranscriber {
           setTimeout(() => this._fetchModels(true), 400);
         }
       }
-    } catch (_) {}
+      this._loadHistory();
+    } catch (_) {
+      this._loadHistory();
+    }
   }
 
   /* ── Fetch models ─────────────────────────────────────── */
@@ -751,6 +790,170 @@ class VideoTranscriber {
   _debounce(fn, ms) {
     let t;
     return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+  }
+
+  /* ── History & Batch ──────────────────────────────────── */
+  async _loadHistory() {
+    try {
+      const r = await fetch(`${this.apiBase}/history`);
+      if (!r.ok) return;
+      const data = await r.json();
+      const history = data.history || [];
+
+      if (history.length > 0) {
+        this.historySection.style.display = 'block';
+        this.historyList.innerHTML = '';
+        history.forEach(item => {
+          const div = document.createElement('div');
+          div.className = 'history-item';
+          div.innerHTML = `
+            <div class="history-info">
+              <div class="history-title">${item.video_title || 'Untitled'}</div>
+              <div class="history-meta">${new Date(item.created_at).toLocaleString()} • ${item.detected_language || '?'} → ${item.summary_language}</div>
+            </div>
+            <div class="history-actions">
+              <button class="btn-dl view-btn" title="View"><i class="fas fa-eye"></i></button>
+            </div>
+          `;
+          div.querySelector('.view-btn').onclick = (e) => {
+            e.stopPropagation();
+            this._showResults(item.script, item.summary, item.video_title, item.translation, item.detected_language, item.summary_language);
+            this.currentTaskId = item.task_id;
+          };
+          div.onclick = () => div.querySelector('.view-btn').click();
+          this.historyList.appendChild(div);
+        });
+      } else {
+        this.historySection.style.display = 'none';
+      }
+    } catch (e) {
+      console.warn('Failed to load history:', e);
+    }
+  }
+
+  async _startTranscription() {
+    if (this.submitBtn.disabled) return;
+
+    const rawUrl = this.videoUrlInput.value.trim();
+    if (!rawUrl) { this._showError(this.t('error_invalid_url')); return; }
+
+    const urls = rawUrl.split('\n').map(u => u.trim()).filter(u => u);
+    if (urls.length === 0) { this._showError(this.t('error_invalid_url')); return; }
+
+    if (urls.length === 1) {
+      await this._processSingleUrl(urls[0]);
+    } else {
+      await this._processBatchUrls(urls);
+    }
+  }
+
+  async _processSingleUrl(url) {
+    const sumLang = this.summaryLangSel.value;
+    const sumStyle = this.summaryStyleSel.value;
+
+    this._setLoading(true);
+    this._hideError();
+    this._showProgress();
+
+    try {
+      const fd = new FormData();
+      fd.append('url', url);
+      fd.append('summary_language', sumLang);
+      fd.append('summary_style', sumStyle);
+
+      const apiKey = this.apiKeyInput.value.trim();
+      const baseUrl = this.modelBaseUrl.value.trim().replace(/\/$/, '');
+      const modelId = this.modelSelect.value;
+      if (apiKey) fd.append('api_key', apiKey);
+      if (baseUrl) fd.append('model_base_url', baseUrl);
+      if (modelId) fd.append('model_id', modelId);
+
+      const resp = await fetch(`${this.apiBase}/process-video`, { method: 'POST', body: fd });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || 'Request failed');
+      }
+
+      const data = await resp.json();
+      this.currentTaskId = data.task_id;
+
+      this._initSP();
+      this._updateProgress(5, this.t('preparing'), true);
+      this._startSSE();
+      this._saveSettings();
+    } catch (err) {
+      this._showError(this.t('error_processing_failed') + err.message);
+      this._setLoading(false);
+      this._hideProgress();
+    }
+  }
+
+  async _processBatchUrls(urls) {
+    const sumLang = this.summaryLangSel.value;
+    const sumStyle = this.summaryStyleSel.value;
+
+    this._setLoading(true);
+    this._hideError();
+    this._showProgress();
+    this._updateProgress(0, this.t('batch_processing'));
+
+    let done = 0;
+    const total = urls.length;
+
+    for (const url of urls) {
+      this._updateProgress((done / total) * 100, this.t('batch_status')(done, total));
+      try {
+        const fd = new FormData();
+        fd.append('url', url);
+        fd.append('summary_language', sumLang);
+        fd.append('summary_style', sumStyle);
+
+        const apiKey = this.apiKeyInput.value.trim();
+        const baseUrl = this.modelBaseUrl.value.trim().replace(/\/$/, '');
+        const modelId = this.modelSelect.value;
+        if (apiKey) fd.append('api_key', apiKey);
+        if (baseUrl) fd.append('model_base_url', baseUrl);
+        if (modelId) fd.append('model_id', modelId);
+
+        const resp = await fetch(`${this.apiBase}/process-video`, { method: 'POST', body: fd });
+        if (resp.ok) {
+          const data = await resp.json();
+          // For batch, we just fire and forget or we could wait. 
+          // To keep it simple and "lazy", we wait for each to finish before starting next
+          // but we don't show full progress for each, just the batch count.
+          await this._pollTask(data.task_id);
+        }
+      } catch (e) {
+        console.error('Batch item failed:', url, e);
+      }
+      done++;
+    }
+
+    this._updateProgress(100, this.t('completed'));
+    this._setLoading(false);
+    setTimeout(() => {
+      this._hideProgress();
+      this._loadHistory();
+    }, 2000);
+  }
+
+  async _pollTask(taskId) {
+    return new Promise((resolve) => {
+      const check = async () => {
+        try {
+          const r = await fetch(`${this.apiBase}/task-status/${taskId}`);
+          if (r.ok) {
+            const task = await r.json();
+            if (task.status === 'completed' || task.status === 'error') {
+              resolve(task);
+              return;
+            }
+          }
+        } catch (_) {}
+        setTimeout(check, 3000);
+      };
+      check();
+    });
   }
 }
 
